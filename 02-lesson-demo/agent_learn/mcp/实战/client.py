@@ -54,6 +54,7 @@ def _make_agent(tools) -> AgentExecutor:
         ("placeholder", "{agent_scratchpad}"),
     ])
     return AgentExecutor(
+        # # 使用 create_tool_calling_agent 函数，它能让 LLM 自动判断何时以及如何调用工具
         agent=create_tool_calling_agent(_make_llm(), tools, prompt),
         tools=tools,
         verbose=True,

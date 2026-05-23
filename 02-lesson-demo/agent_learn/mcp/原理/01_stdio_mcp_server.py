@@ -177,27 +177,18 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()  # 响应 tools/call 请求，执行工具并返回结果
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     """
-    工具调度器：先用 Pydantic 校验参数，再执行业务逻辑。
-    校验失败时返回错误文本，不抛异常（让 LLM 读到错误后自我修正）。
+    工具调度器：通过 _TOOL_REGISTRY 查表分发，无需 if-elif。
+    新增工具只需在注册表里加一行，此处不用改动。
     """
+    entry = _TOOL_REGISTRY.get(name)
+    if entry is None:
+        return [types.TextContent(type="text", text=f"错误：未知工具 '{name}'")]
+    model_cls, handler = entry
     try:
-        if name == "get_current_time":
-            params = GetCurrentTimeInput(**arguments)   # ① Pydantic 校验
-            return await _get_current_time(params)      # ② 校验通过才执行
-        elif name == "read_file":
-            params = ReadFileInput(**arguments)
-            return await _read_file(params)
-        elif name == "write_file":
-            params = WriteFileInput(**arguments)
-            return await _write_file(params)
-        elif name == "list_directory":
-            params = ListDirectoryInput(**arguments)
-            return await _list_directory(params)
-        else:
-            return [types.TextContent(type="text", text=f"错误：未知工具 '{name}'")]
-
+        params = model_cls(**arguments)   # ① Pydantic 校验
+        return await handler(params)      # ② 校验通过才执行
     except ValidationError as e:
-        return _validation_error_response(e)  # Pydantic 校验失败，返回结构化错误信息
+        return _validation_error_response(e)
 
 
 # ── 工具实现：参数类型从 dict 改为 Pydantic 模型实例 ─────────────────────────
@@ -255,6 +246,16 @@ async def _list_directory(params: ListDirectoryInput) -> list[types.TextContent]
         return [types.TextContent(type="text", text=result)]
     except Exception as e:
         return [types.TextContent(type="text", text=f"错误：{str(e)}")]
+
+
+# 工具注册表：name → (Pydantic模型类, 处理函数)
+# 新增工具只需在此处加一行，call_tool 调度器无需改动
+_TOOL_REGISTRY = {
+    "get_current_time": (GetCurrentTimeInput, _get_current_time),
+    "read_file":        (ReadFileInput,        _read_file),
+    "write_file":       (WriteFileInput,       _write_file),
+    "list_directory":   (ListDirectoryInput,   _list_directory),
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

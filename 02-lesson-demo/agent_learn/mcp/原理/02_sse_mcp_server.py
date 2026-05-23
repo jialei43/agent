@@ -35,6 +35,8 @@ load_dotenv(find_dotenv())  # 加载 .env
 
 mcp_server = Server("remote-api-tools")  # MCP Server 实例
 web_app = FastAPI(title="MCP SSE Server", version="1.0.0")  # FastAPI 实例
+#  SseServerTransport("/messages") 中的 "/messages" 这个字符串，只做一件事：告诉 SSE 长连接，客户端应该把后续的
+#   JSON-RPC 请求 POST 到哪个路径
 sse_transport = SseServerTransport("/messages")  # SSE 传输层，指定 POST 端点路径
 
 

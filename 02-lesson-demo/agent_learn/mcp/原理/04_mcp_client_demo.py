@@ -34,7 +34,7 @@ from typing import Optional, Any
 from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field, create_model  # 动态 Schema 构建
 from mcp import ClientSession, types
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from langchain_openai import ChatOpenAI
@@ -76,6 +76,27 @@ _JSON_TYPE_MAP: dict[str, Any] = {
 }
 
 
+def _extract_py_type(field_def: dict) -> type:
+    """
+    从单个 JSON Schema 字段定义中提取 Python 类型。
+
+    两种结构：
+      普通字段：{"type": "string", ...}
+      Optional 字段：{"anyOf": [{"type": "string"}, {"type": "null"}], ...}
+                    （Pydantic v2 对 Optional[str] 生成的 Schema）
+    """
+    if "type" in field_def:
+        return _JSON_TYPE_MAP.get(field_def["type"], str)
+
+    if "anyOf" in field_def:
+        # 过滤掉 {"type": "null"}，取第一个非 null 类型
+        non_null = [s for s in field_def["anyOf"] if s.get("type") != "null"]
+        if non_null:
+            return _JSON_TYPE_MAP.get(non_null[0].get("type", "string"), str)
+
+    return str  # 兜底
+
+
 def build_args_schema(tool_name: str, input_schema: dict) -> type[BaseModel]:
     """
     从 MCP Tool 的 inputSchema（JSON Schema dict）动态生成 Pydantic BaseModel。
@@ -92,8 +113,8 @@ def build_args_schema(tool_name: str, input_schema: dict) -> type[BaseModel]:
 
     field_definitions: dict[str, tuple] = {}
     for field_name, field_def in props.items():
-        # 1. 确定 Python 类型
-        py_type = _JSON_TYPE_MAP.get(field_def.get("type", "string"), str)
+        # 1. 确定 Python 类型（兼容直接 type 和 anyOf 两种结构）
+        py_type = _extract_py_type(field_def)
 
         # 2. 构建 Field 注解
         description = field_def.get("description", "")
@@ -108,6 +129,45 @@ def build_args_schema(tool_name: str, input_schema: dict) -> type[BaseModel]:
                 Optional[py_type],
                 Field(default=actual_default, description=description),
             )
+
+    """
+    第一行：生成类名字符串
+
+    
+    class_name = "".join(w.capitalize() for w in tool_name.split("_")) + "Args"
+    以 tool_name = "read_file" 为例，逐步拆解：
+    
+    
+    tool_name.split("_")          # ["read", "file"]       按下划线切开
+    
+    w.capitalize() for w in ...   # ["Read", "File"]        每个单词首字母大写
+    
+    "".join(...)                  # "ReadFile"              拼在一起，无分隔符
+    
+    + "Args"                      # "ReadFileArgs"          加后缀，表示这是参数模型
+    目的只是给动态生成的类取个有意义的名字，便于调试时看到类名知道是哪个工具的参数。
+    
+    第二行：动态创建 Pydantic 模型类
+    
+    
+    return create_model(class_name, **field_definitions)
+    create_model 是 Pydantic 提供的工厂函数，作用等价于在运行时写了这段代码：
+    
+    
+    # field_definitions 长这样（以 read_file 为例）：
+    # {
+    #     "path":     (str,         Field(...,          description="文件路径")),
+    #     "encoding": (Optional[str], Field("utf-8",   description="文件编码")),
+    # }
+    
+    # create_model 展开后等价于：
+    class ReadFileArgs(BaseModel):
+        path:     str            = Field(...,    description="文件路径")
+        encoding: Optional[str]  = Field("utf-8", description="文件编码")
+    **field_definitions 是把字典展开作为关键字参数传入，create_model 规定每个参数的值是 (类型, Field(...)) 的元组，它会自动识别并构建对应字段。
+    
+    区别在于：普通 class 定义是静态的，写死在源码里；create_model 是运行时根据 MCP Server 返回的 Schema 动态构建，Server 加什么字段就生成什么字段，client 代码不用改。
+    """
 
     # create_model 动态生成 Pydantic 类，类名用工具名驼峰格式
     class_name = "".join(w.capitalize() for w in tool_name.split("_")) + "Args"
@@ -257,7 +317,7 @@ async def demo_stdio_qwen():
     server_script = Path(__file__).parent / "01_stdio_mcp_server.py"
     llm = make_llm()
 
-    async with stdio_client(sys.executable, [str(server_script)]) as (read, write):
+    async with stdio_client(StdioServerParameters(command=sys.executable, args=[str(server_script)])) as (read, write):
         async with ClientSession(read, write) as session:
             print("\n正在从 stdio MCP Server 加载工具（01_stdio_mcp_server.py）...")
             tools = await load_structured_tools(session)
@@ -334,7 +394,7 @@ async def demo_inspect_schemas():
 
     server_script = Path(__file__).parent / "01_stdio_mcp_server.py"
 
-    async with stdio_client(sys.executable, [str(server_script)]) as (read, write):
+    async with stdio_client(StdioServerParameters(command=sys.executable, args=[str(server_script)])) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools_result = await session.list_tools()
@@ -368,8 +428,8 @@ async def main():
 
     await demo_inspect_schemas()          # 演示四：先看 Schema 转换结果，理解机制
     await demo_stdio_qwen()               # 演示一：主演示（无需额外启动）
-    await demo_sse_qwen()                 # 演示二：SSE（如已启动）
-    await demo_streamable_http_qwen()     # 演示三：Streamable HTTP（如已启动）
+    # await demo_sse_qwen()                 # 演示二：SSE（如已启动）
+    # await demo_streamable_http_qwen()     # 演示三：Streamable HTTP（如已启动）
 
     print("\n" + "=" * 60)
     print("  全部演示完成")

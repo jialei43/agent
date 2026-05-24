@@ -225,6 +225,13 @@ TOOLS_MAP = {
 }
 
 
+def _tools_desc(tools: dict) -> str:
+    return "\n".join(
+        f"- {name}：{fn.description.splitlines()[0].strip()}"
+        for name, fn in tools.items()
+    )
+
+
 class PlanAndExecuteAgent:
     """
     规划-执行分离的 Agent。
@@ -247,14 +254,11 @@ class PlanAndExecuteAgent:
         print("\n【阶段一：规划】Planner 正在生成执行计划...")
 
         messages = [
-            SystemMessage(content="""你是一个专业的项目风险评估规划师。
+            SystemMessage(content=f"""你是一个专业的项目风险评估规划师。
 根据用户描述的项目，生成一个详细的风险评估执行计划。
 
 可用工具：
-- analyze_tech_stack：分析技术栈风险（输入：项目技术描述）
-- evaluate_team_capacity：评估团队能力（输入：团队规模和技能描述）
-- assess_timeline_risk：评估时间线风险（输入：时间计划描述）
-- calculate_risk_score：计算综合风险评分（输入：格式 'LEVEL:count,...'）
+{_tools_desc(TOOLS_MAP)}
 
 规划原则：
 1. calculate_risk_score 必须在其他评估完成后执行（依赖前三步结果）

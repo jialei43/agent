@@ -19,9 +19,10 @@ from typing import Any
 from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_react_agent, AgentExecutor
+from langchain.agents import create_react_agent, create_tool_calling_agent, AgentExecutor
 
 load_dotenv(find_dotenv())
 
@@ -252,36 +253,113 @@ def check_test_coverage_hints(code: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ReAct Agent 构建
+# Agent 构建（两种方式对比）
 # ══════════════════════════════════════════════════════════════════════════════
 
 REVIEW_TOOLS = [analyze_complexity, check_security_issues, check_code_style, check_test_coverage_hints]
 
-# ReAct 的 Prompt 决定 Agent 的推理风格和输出格式
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 让 Tool Calling 推理过程可见的两种方式
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 可见推理方式一：自定义 Callback Handler（推荐，无侵入）
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 原理：LangChain 在 Agent 每次调用工具前后都会触发回调事件，
+#       通过实现 BaseCallbackHandler 的钩子方法，可以拦截并打印推理过程。
+# 优点：完全不改变 Agent 逻辑，生产环境可接入日志系统/监控平台（如 LangSmith）
+
+class ReasoningCallbackHandler(BaseCallbackHandler):
+    """拦截 Tool Calling Agent 的每一步行为，将推理过程打印出来"""
+
+    # ── 为什么用 on_tool_start 而不是 on_agent_action ──────────────────────────
+    # create_tool_calling_agent 返回的是 LCEL Runnable，不是老版 Agent 类。
+    # 在 LCEL 执行链路中，on_agent_action 不一定可靠触发；
+    # on_tool_start 由工具自身的 Runnable 发出，无论哪种 Agent 类型都会触发。
+    #
+    # 事件顺序：on_tool_start → 工具执行 → on_tool_end → on_agent_finish
+
+    def on_tool_start(self, serialized: dict, input_str: str, **_):
+        """工具开始执行时触发（由工具自身的 Runnable 发出，比 on_agent_action 更可靠）"""
+        tool_name = serialized.get("name", "unknown")
+        print(f"\n  ┌─[推理] 调用工具: {tool_name}")
+        print(f"  │  输入: {input_str[:120]}{'...' if len(input_str) > 120 else ''}")
+
+    def on_tool_end(self, output: str, **_):
+        """工具执行完毕，返回结果时触发"""
+        output_preview = str(output)[:200]
+        print(f"  └─[观察] {output_preview}{'...' if len(str(output)) > 200 else ''}")
+
+    def on_agent_finish(self, _finish, **_kw):
+        """Agent 完成所有工具调用，准备输出最终答案时触发"""
+        print(f"\n  [完成] 推理结束，生成最终报告")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 可见推理方式二：think 工具（强制模型在每次调用前显式记录推理）
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 原理：注册一个特殊的 think 工具，tool description 要求模型在调用任何实际工具前
+#       先调用 think() 写下判断依据。think 工具本身什么都不做，只把推理内容打印出来。
+# 优点：推理内容结构化、可存储到数据库，形成可审计的决策日志
+# 缺点：增加一次额外的工具调用（多一次 LLM → 工具交互），有轻微延迟
+
+@tool
+def think(reasoning: str) -> str:
+    """
+    在调用其他工具之前，先调用此工具记录你的推理过程。
+    参数 reasoning：说明你为什么选择下一个工具、期望获取什么信息。
+    这是一个推理记录工具，不会影响实际检查结果。
+    """
+    print(f"\n  [思考] {reasoning}")
+    return "推理已记录，请继续执行下一步"
+
+
+REVIEW_TOOLS_WITH_THINK = [think] + REVIEW_TOOLS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 方式一：[旧] ReAct —— 工具列表写在 Prompt 里，LLM 输出文本格式推理链
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 原理：
+#   1. {tools} 占位符把所有工具的名称+描述拼成一大段文本注入 prompt
+#   2. LLM 输出 "Thought/Action/Action Input/Observation" 格式的纯文本
+#   3. 框架用正则表达式从文本中解析出工具名和参数，再去调用工具
+#
+# 缺点：
+#   - 工具描述占用大量 token（工具越多 prompt 越长）
+#   - 依赖文本格式解析，格式错误时需要 handle_parsing_errors=True 重试
+#   - 模型必须"记住"并精确输出特定格式，较小模型容易格式混乱
+#
+# 适用：模型不支持 function calling 时的唯一选择（如早期开源模型）
+
+# [旧-更早] 规则引导版：强制必须使用所有工具、硬编码报告格式
+# REACT_PROMPT_OLD = ChatPromptTemplate.from_template("""...
+# 审查要求：
+# 1. 必须使用所有四个工具进行检查（复杂度、安全、规范、测试覆盖）
+# ...
+# """)
+
+# [旧] 动态 ReAct 版：工具仍在 prompt 里，但不强制调用所有工具
 REACT_PROMPT = ChatPromptTemplate.from_template("""你是一个专业的企业级代码审查助手。
-使用工具对提交的代码进行全面审查，最终输出一份结构化的审查报告。
+根据提交代码的实际特征，自主判断最需要关注的审查维度，给出有针对性的专业意见。
 
-审查要求：
-1. 必须使用所有四个工具进行检查（复杂度、安全、规范、测试覆盖）
-2. 综合所有工具结果，给出整体质量评分（0-100）
-3. 最终报告格式：
-   - 整体评分与结论（通过/需修改/拒绝）
-   - 关键问题列表（按优先级排序）
-   - 修复建议
-
-可用工具：
+可用工具（根据代码特征按需选用，不必强制全部调用）：
 {tools}
 
 工具名称：{tool_names}
 
 使用格式（严格遵守）：
-Thought: 分析当前情况，决定下一步
+Thought: 观察代码特征，判断当前最值得检查哪个维度以及为什么
 Action: 工具名称
 Action Input: 工具的输入参数
 Observation: 工具返回的结果
-... （重复 Thought/Action/Observation）
-Thought: 已有足够信息，可以给出最终答案
-Final Answer: 完整的审查报告
+... （重复 Thought/Action/Observation，直到掌握足够信息）
+Thought: 已有足够信息，整理发现
+Final Answer: 针对本次代码最关键问题的审查报告，重点突出发现的实际问题，无问题的维度简略带过
 
 开始审查：
 {input}
@@ -289,7 +367,7 @@ Final Answer: 完整的审查报告
 {agent_scratchpad}""")
 
 
-def build_review_agent(verbose: bool = True) -> AgentExecutor:
+def build_react_agent(verbose: bool = True) -> AgentExecutor:
     llm = ChatOpenAI(
         model="qwen-plus",
         api_key=os.getenv("DASHSCOPE_API_KEY"),
@@ -301,11 +379,89 @@ def build_review_agent(verbose: bool = True) -> AgentExecutor:
         agent=agent,
         tools=REVIEW_TOOLS,
         verbose=verbose,
-        max_iterations=10,          # 最多10轮工具调用，防止死循环
-        max_execution_time=120,     # 最长120秒
-        handle_parsing_errors=True, # 格式解析失败时让 Agent 自我修正
-        return_intermediate_steps=True,  # 返回中间推理步骤，可用于审计
+        max_iterations=10,
+        max_execution_time=120,
+        handle_parsing_errors=True,      # ReAct 必须：文本解析失败时让 Agent 自我修正
+        return_intermediate_steps=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 方式二：[新] Tool Calling —— 工具通过 API 绑定给模型，Prompt 里不再列举工具
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 原理：
+#   1. create_tool_calling_agent 内部调用 llm.bind_tools(tools)，
+#      把工具的 JSON Schema 通过 API 的 tools 参数直接传给模型
+#   2. 模型原生返回结构化的工具调用请求（JSON），无需文本解析
+#   3. Prompt 里不再需要 {tools}/{tool_names} 占位符，模型通过 API 感知工具
+#
+# 优点：
+#   - Prompt 更简洁，不占用工具描述 token
+#   - 工具调用可靠：结构化 JSON，不会因格式混乱解析失败
+#   - 模型能更精确地构造工具参数（有 Schema 约束）
+#   - 支持并行工具调用（一次 LLM 调用同时触发多个工具）
+#
+# 适用：所有支持 function calling 的现代模型（GPT-4/Claude/Qwen-plus 等）
+
+TOOL_CALLING_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是一个专业的企业级代码审查助手。
+根据提交代码的实际特征，自主选择需要调用的检查工具，给出有针对性的专业审查意见。
+重点突出实际发现的问题，无问题的维度简略带过，不必强制调用所有工具。"""),
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),   # Tool Calling 的中间步骤占位符
+])
+# 注意：Prompt 里没有 {tools} 和 {tool_names}，工具通过 llm.bind_tools() 在 API 层传递
+
+
+def build_tool_calling_agent(
+    verbose: bool = False,
+    reasoning_mode: str = "callback",   # "callback" | "think_tool" | "none"
+) -> AgentExecutor:
+    """
+    reasoning_mode 控制推理过程的可见方式：
+      "callback"   — 通过 Callback Handler 拦截每步行为（无侵入，推荐）
+      "think_tool" — 注入 think 工具，强制模型在每次调用前显式写下推理
+      "none"       — 不显示推理过程（verbose=True 时仍显示 LangChain 内置日志）
+    """
+    llm = ChatOpenAI(
+        model="qwen-plus",
+        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        temperature=0,
+    )
+
+    if reasoning_mode == "think_tool":
+        # 注入 think 工具，模型在 prompt 引导下每步先 think() 再调用实际工具
+        tools = REVIEW_TOOLS_WITH_THINK
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """你是一个专业的企业级代码审查助手。
+每次调用检查工具之前，必须先调用 think 工具写下你的判断依据（为什么选这个工具、期望发现什么）。
+根据代码实际特征按需选择检查工具，不必强制调用所有工具。"""),
+            ("human", "{input}"),
+            MessagesPlaceholder("agent_scratchpad"),
+        ])
+        callbacks = []
+    else:
+        tools = REVIEW_TOOLS
+        prompt = TOOL_CALLING_PROMPT
+        # callback 模式：用 ReasoningCallbackHandler 拦截工具调用事件
+        callbacks = [ReasoningCallbackHandler()] if reasoning_mode == "callback" else []
+
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=verbose,
+        max_iterations=10,
+        max_execution_time=120,
+        return_intermediate_steps=True,
+        callbacks=callbacks,
+    )
+
+
+# 默认使用 Tool Calling 方式（更可靠）
+build_review_agent = build_tool_calling_agent
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,16 +508,36 @@ SAMPLE_CODE = textwrap.dedent("""
 
 
 def main():
+    # ── 三种推理可见模式，切换注释体验差异 ──────────────────────────────────────
+    #
+    # 模式 A：Callback 拦截（推荐）
+    #   推理过程由框架事件驱动显示，Agent 逻辑本身不变
+    agent_executor = build_tool_calling_agent(reasoning_mode="callback")
+    mode_label = "Tool Calling + Callback 推理可见"
+    #
+    # 模式 B：think 工具
+    #   模型被提示词引导，主动调用 think() 记录判断依据
+    # agent_executor = build_tool_calling_agent(reasoning_mode="think_tool")
+    # mode_label = "Tool Calling + think 工具推理可见"
+    #
+    # 模式 C：无推理输出（只看最终报告）
+    # agent_executor = build_tool_calling_agent(reasoning_mode="none")
+    # mode_label = "Tool Calling（无推理输出）"
+    #
+    # 模式 D：ReAct（推理写在文本里，通过 verbose=True 可见）
+    # agent_executor = build_react_agent(verbose=True)
+    # mode_label = "ReAct（Thought/Action/Observation 文本格式）"
+    # ────────────────────────────────────────────────────────────────────────────
+
     print("=" * 60)
-    print("  ReAct Agent：企业代码审查助手")
+    print(f"  代码审查助手  [{mode_label}]")
     print("=" * 60)
     print("\n待审查代码：")
     print(SAMPLE_CODE)
     print("\n" + "=" * 60)
-    print("开始 ReAct 推理链...")
+    print("开始审查（推理过程实时输出）...")
     print("=" * 60 + "\n")
 
-    agent_executor = build_review_agent(verbose=True)
     result = agent_executor.invoke({
         "input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{SAMPLE_CODE}\n```"
     })
@@ -370,8 +546,6 @@ def main():
     print("最终审查报告：")
     print("=" * 60)
     print(result["output"])
-
-    # 中间推理步骤（可用于审计日志）
     print(f"\n共执行了 {len(result['intermediate_steps'])} 次工具调用")
 
 

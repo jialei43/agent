@@ -238,14 +238,26 @@ class MemoryAugmentedAgent:
         """组装完整的系统 Prompt（用户画像 + 历史经验 + 领域知识）"""
         profile = self.user_profile
 
-        # 根据技术水平调整回答风格
-        style_map = {
-            "junior": "用简单易懂的语言，避免缩写，多举例子，提供完整的操作步骤",
-            "mid":    "保持技术准确性，适当提供背景原理，给出实用的代码示例",
-            "senior": "直接给出核心结论，聚焦边界情况和性能影响，无需解释基础概念",
-            "principal": "提供架构层面的思考，权衡利弊，讨论规模化方案",
-        }
-        answer_style = style_map.get(profile.tech_level, style_map["mid"])
+        # ── [旧] 规则引导版：4档固定风格表，技术水平→回答风格一一对应 ──
+        # 缺点：同一等级的用户背景差异很大（如 senior Java 工程师 vs senior ML 研究员），
+        #       固定映射无法体现用户具体技术栈和痛点对沟通方式的影响
+        # style_map = {
+        #     "junior": "用简单易懂的语言，避免缩写，多举例子，提供完整的操作步骤",
+        #     "mid":    "保持技术准确性，适当提供背景原理，给出实用的代码示例",
+        #     "senior": "直接给出核心结论，聚焦边界情况和性能影响，无需解释基础概念",
+        #     "principal": "提供架构层面的思考，权衡利弊，讨论规模化方案",
+        # }
+        # answer_style = style_map.get(profile.tech_level, style_map["mid"])
+
+        # ── [新] 动态推理版：将完整用户画像注入，让 LLM 自主判断合适的沟通深度 ──
+        # 核心改变：不再用 tech_level 查表，而是把用户的角色、等级、技术栈、痛点一起告诉 LLM，
+        # 让 LLM 综合这些信息自主决定回答深度、是否需要解释概念、示例复杂程度等
+        answer_style = (
+            f"用户是 {profile.tech_level} 级别的 {profile.role}，"
+            f"熟悉 {', '.join(profile.known_stack) if profile.known_stack else '技术背景未知'}，"
+            f"常见痛点为 {', '.join(profile.pain_points) if profile.pain_points else '未记录'}。"
+            "请根据其完整背景自主判断：回答的技术深度、是否需要解释基础概念、示例的复杂程度。"
+        )
 
         system_parts = [
             f"""你是一位企业技术顾问，专门服务 {profile.role} 工程师。
@@ -300,15 +312,35 @@ class MemoryAugmentedAgent:
     # ── 记忆存储 ──────────────────────────────────────────────────────────────
 
     def _extract_tags(self, question: str, answer: str) -> list[str]:
-        """从 Q&A 中提取主题标签（生产中用 NER 或 LLM 提取）"""
-        tech_keywords = [
-            "MySQL", "PostgreSQL", "Redis", "Kafka", "Kubernetes", "Docker",
-            "Python", "Java", "Go", "API", "HTTP", "gRPC", "SQL", "索引",
-            "缓存", "并发", "锁", "事务", "超时", "熔断", "监控", "告警",
-            "部署", "容器", "集群", "网络", "安全", "认证", "性能", "内存",
-        ]
-        text = (question + " " + answer).lower()
-        return [kw for kw in tech_keywords if kw.lower() in text][:5]
+        """从 Q&A 中提取主题标签"""
+        # ── [旧] 规则引导版：预设关键词白名单，只能匹配列表中的技术词 ──
+        # 缺点：列表需手动维护；新技术词（如 Rust、eBPF）不在列表中就无法打标；
+        #       无法理解语义，无法区分"Redis 锁"和"Redis 缓存"
+        # tech_keywords = [
+        #     "MySQL", "PostgreSQL", "Redis", "Kafka", "Kubernetes", "Docker",
+        #     "Python", "Java", "Go", "API", "HTTP", "gRPC", "SQL", "索引",
+        #     "缓存", "并发", "锁", "事务", "超时", "熔断", "监控", "告警",
+        #     "部署", "容器", "集群", "网络", "安全", "认证", "性能", "内存",
+        # ]
+        # text = (question + " " + answer).lower()
+        # return [kw for kw in tech_keywords if kw.lower() in text][:5]
+
+        # ── [新] 动态推理版：使用 LLM 从问答内容中语义提取核心技术标签 ──
+        # 核心改变：不依赖预设词表，LLM 自主理解问答主题并提取最有代表性的技术标签，
+        # 可识别任意技术词汇，且能区分同一技术的不同使用场景（如"Redis 缓存穿透" vs "Redis 集群"）
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=(
+                    "从以下技术问答中提取3-5个核心技术主题标签，用英文逗号分隔，"
+                    "只输出标签本身，不要编号，不要解释。"
+                    "标签应尽量具体（如'Redis 缓存击穿'优于'Redis'）。"
+                )),
+                HumanMessage(content=f"问题：{question}\n\n回答摘要：{answer[:300]}"),
+            ])
+            tags = [t.strip() for t in response.content.split(",") if t.strip()]
+            return tags[:5]
+        except Exception:
+            return []
 
     def _score_answer_quality(self, question: str, answer: str) -> float:
         """评估答案质量（简化版，生产中可用 LLM 评估）"""
@@ -325,14 +357,15 @@ class MemoryAugmentedAgent:
             score -= 0.1
         return min(1.0, max(0.0, score))
 
-    def _store_to_episodic_memory(self, question: str, answer: str):
+    def _store_to_episodic_memory(self, question: str, answer: str, tags: list[str] | None = None):
         """将本次 Q&A 存入情节记忆"""
         memory_id = hashlib.md5(f"{question}{time.time()}".encode()).hexdigest()[:12]
         memory = EpisodicMemory(
             memory_id=memory_id,
             question=question,
             answer=answer,
-            tags=self._extract_tags(question, answer),
+            # [新] 接受外部传入的 tags（由 chat() 统一提取），避免重复调用 LLM
+            tags=tags if tags is not None else self._extract_tags(question, answer),
             quality_score=self._score_answer_quality(question, answer),
             created_at=datetime.now().isoformat(),
             user_id=self.user_id,
@@ -341,17 +374,26 @@ class MemoryAugmentedAgent:
 
     # ── 用户画像更新 ──────────────────────────────────────────────────────────
 
-    def _update_user_profile(self, question: str):
+    def _update_user_profile(self, question: str, learned_techs: list[str] | None = None):
         """根据对话更新用户画像（技术栈、痛点）"""
         profile = self.user_profile
         profile.interaction_count += 1
         profile.last_seen = datetime.now().strftime("%Y-%m-%d")
 
-        # 简单的技术栈学习
-        tech_keywords = {"Python", "Java", "Go", "Kubernetes", "MySQL", "Redis", "Kafka"}
-        for tech in tech_keywords:
-            if tech.lower() in question.lower() and tech not in profile.known_stack:
-                profile.known_stack.append(tech)
+        # ── [旧] 规则引导版：硬编码技术词集合，只识别列表中的技术 ──
+        # 缺点：覆盖范围有限，无法学习列表之外的技术词
+        # tech_keywords = {"Python", "Java", "Go", "Kubernetes", "MySQL", "Redis", "Kafka"}
+        # for tech in tech_keywords:
+        #     if tech.lower() in question.lower() and tech not in profile.known_stack:
+        #         profile.known_stack.append(tech)
+
+        # ── [新] 动态推理版：复用 LLM 提取的标签，从中学习用户技术栈 ──
+        # 核心改变：不依赖预设词表，直接将 _extract_tags 已提取的标签用于画像更新，
+        # 复用同一次 LLM 调用的结果，不产生额外 API 开销
+        if learned_techs:
+            for tech in learned_techs:
+                if tech not in profile.known_stack:
+                    profile.known_stack.append(tech)
 
     # ── 主对话接口 ────────────────────────────────────────────────────────────
 
@@ -379,10 +421,12 @@ class MemoryAugmentedAgent:
         answer = self._generate_answer(user_question, system_prompt)
 
         # Step 4: 更新记忆
-        self._store_to_episodic_memory(user_question, answer)
+        # [新] 提取一次标签，同时供情节记忆存储和用户画像更新使用，避免重复 LLM 调用
+        tags = self._extract_tags(user_question, answer)
+        self._store_to_episodic_memory(user_question, answer, tags=tags)
         self.short_term.append(ConversationTurn("user", user_question, datetime.now().isoformat()))
         self.short_term.append(ConversationTurn("assistant", answer, datetime.now().isoformat()))
-        self._update_user_profile(user_question)
+        self._update_user_profile(user_question, learned_techs=tags)
 
         print(f"[Assistant] {answer}\n")
         print(f"[Memory] 情节记忆库：{len(self.episodic_store)} 条  短期记忆：{len(self.short_term)//2} 轮")

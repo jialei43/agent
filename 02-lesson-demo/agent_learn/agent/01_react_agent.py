@@ -272,7 +272,11 @@ REVIEW_TOOLS = [analyze_complexity, check_security_issues, check_code_style, che
 # 优点：完全不改变 Agent 逻辑，生产环境可接入日志系统/监控平台（如 LangSmith）
 
 class ReasoningCallbackHandler(BaseCallbackHandler):
-    """拦截 Tool Calling Agent 的每一步行为，将推理过程打印出来"""
+    """拦截 Tool Calling Agent 的每一步行为，将推理过程打印出来。
+
+    react_format=True 时输出与 build_react_agent(verbose=True) 完全一致的
+    Thought/Action/Action Input/Observation 格式，方便两种 Agent 对比。
+    """
 
     # ── 为什么用 on_tool_start 而不是 on_agent_action ──────────────────────────
     # create_tool_calling_agent 返回的是 LCEL Runnable，不是老版 Agent 类。
@@ -281,20 +285,37 @@ class ReasoningCallbackHandler(BaseCallbackHandler):
     #
     # 事件顺序：on_tool_start → 工具执行 → on_tool_end → on_agent_finish
 
+    def __init__(self, react_format: bool = False):
+        super().__init__()
+        self._react_format = react_format
+        self._current_tool: str | None = None  # 追踪当前工具名，用于 on_tool_end 判断
+
     def on_tool_start(self, serialized: dict, input_str: str, **_):
-        """工具开始执行时触发（由工具自身的 Runnable 发出，比 on_agent_action 更可靠）"""
         tool_name = serialized.get("name", "unknown")
-        print(f"\n  ┌─[推理] 调用工具: {tool_name}")
-        print(f"  │  输入: {input_str[:120]}{'...' if len(input_str) > 120 else ''}")
+        self._current_tool = tool_name
+        if tool_name == "think":
+            return  # think 工具由其自身函数体打印 Thought:，此处跳过
+        if self._react_format:
+            print(f"\nAction: {tool_name}")
+            print(f"Action Input: {input_str[:200]}{'...' if len(input_str) > 200 else ''}")
+        else:
+            print(f"\n  ┌─[推理] 调用工具: {tool_name}")
+            print(f"  │  输入: {input_str[:120]}{'...' if len(input_str) > 120 else ''}")
 
     def on_tool_end(self, output: str, **_):
-        """工具执行完毕，返回结果时触发"""
-        output_preview = str(output)[:200]
-        print(f"  └─[观察] {output_preview}{'...' if len(str(output)) > 200 else ''}")
+        if self._current_tool == "think":
+            return  # think 工具的返回值只是提示语，不需要打印
+        output_str = str(output)
+        if self._react_format:
+            print(f"Observation: {output_str[:200]}{'...' if len(output_str) > 200 else ''}")
+        else:
+            print(f"  └─[观察] {output_str[:200]}{'...' if len(output_str) > 200 else ''}")
 
     def on_agent_finish(self, _finish, **_kw):
-        """Agent 完成所有工具调用，准备输出最终答案时触发"""
-        print(f"\n  [完成] 推理结束，生成最终报告")
+        if self._react_format:
+            print("\nThought: 已收集完所有必要信息，生成最终报告")
+        else:
+            print(f"\n  [完成] 推理结束，生成最终报告")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -449,7 +470,7 @@ def build_tool_calling_agent(
             ("human", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
         ])
-        callbacks = []
+        callbacks = []  # 推理步骤通过 _format_react_output 后处理输出，不依赖 callback 传播
     else:
         tools = REVIEW_TOOLS
         prompt = TOOL_CALLING_PROMPT
@@ -466,6 +487,32 @@ def build_tool_calling_agent(
         return_intermediate_steps=True,
         callbacks=callbacks,
     )
+
+
+def _format_react_output(intermediate_steps: list) -> None:
+    """
+    将 intermediate_steps 以 Thought/Action/Action Input/Observation 格式打印。
+
+    为什么用后处理而非 callback：
+      LCEL 版 AgentExecutor 的 callbacks 参数只对 executor 层事件可靠（如 on_agent_finish），
+      on_tool_start / on_tool_end 在新版 LangChain 中不一定能传播到工具子 run。
+      intermediate_steps 由框架保证完整记录，与 LangChain 版本无关。
+    """
+    for action, observation in intermediate_steps:
+        tool_input = action.tool_input
+        input_str = (
+            str(next(iter(tool_input.values()), ""))
+            if isinstance(tool_input, dict)
+            else str(tool_input)
+        )
+        if action.tool == "think":
+            print(f"\nThought: {input_str}")
+        else:
+            print(f"\nAction: {action.tool}")
+            print(f"Action Input: {input_str[:300]}{'...' if len(input_str) > 300 else ''}")
+            obs_str = str(observation)
+            print(f"Observation: {obs_str[:300]}{'...' if len(obs_str) > 300 else ''}")
+    print("\nThought: 已收集完所有必要信息，生成最终报告")
 
 
 # 默认使用 Tool Calling 方式（更可靠）
@@ -524,13 +571,13 @@ def main():
     #
     # ReAct：推理全程可见（Thought/Action/Observation），适合调试、学习、审计
     #   LLM 把决策过程写成文本，框架用正则解析后调用工具
-    agent_executor = build_react_agent(verbose=True)
-    mode_label = "ReAct（Thought/Action/Observation 完整推理链）"
-    #
+    # agent_executor = build_react_agent(verbose=True)
+    # mode_label = "ReAct（Thought/Action/Observation 完整推理链）"
+    # #
     # Tool Calling：生产环境首选，结构化 JSON 调用，不显示推理过程
     #   如果需要生产可靠性而不需要看推理，取消下面两行的注释
-    # agent_executor = build_tool_calling_agent(reasoning_mode="none")
-    # mode_label = "Tool Calling（生产模式，无推理输出）"
+    agent_executor = build_tool_calling_agent(reasoning_mode="think_tool")
+    mode_label = "Tool Calling + Think Tool（ReAct 格式推理输出）"
     # ─────────────────────────────────────────────────────────────────────────
     # ────────────────────────────────────────────────────────────────────────────
 
@@ -546,6 +593,11 @@ def main():
     result = agent_executor.invoke({
         "input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{SAMPLE_CODE}\n```"
     })
+
+    print("\n" + "─" * 60)
+    print("推理过程（ReAct 格式）：")
+    print("─" * 60)
+    _format_react_output(result["intermediate_steps"])
 
     print("\n" + "=" * 60)
     print("最终审查报告：")

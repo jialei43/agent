@@ -447,34 +447,45 @@ def build_tool_calling_agent(
       "think_tool" — 注入 think 工具，强制模型在每次调用前显式写下推理
       "none"       — 不显示推理过程（verbose=True 时仍显示 LangChain 内置日志）
     """
-    llm = ChatOpenAI(
-        model="qwen-plus",
-        api_key=os.getenv("DASHSCOPE_API_KEY"),
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0,
-    )
-
     if reasoning_mode == "think_tool":
-        # 注入 think 工具，模型在 prompt 引导下每步先 think() 再调用实际工具
+        # parallel_tool_calls=False：禁止模型一次并行调用多个工具。
+        # 只有禁止并行，模型每轮才只调用一个工具，think → 检查工具 的交替模式才能成立。
+        llm = ChatOpenAI(
+            model="qwen-plus",
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            temperature=0,
+            model_kwargs={"parallel_tool_calls": False},
+        )
         tools = REVIEW_TOOLS_WITH_THINK
         prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个专业的企业级代码审查助手。
 
-严格按照以下节奏工作，不得跳过任何步骤：
-  think（说明本步理由）→ 实际检查工具 → think（说明下一步理由）→ 实际检查工具 → ...→ 给出 Final Answer
+【强制执行，每一轮必须严格遵守，违反则本次审查无效】：
+第一步：必须先调用 think 工具，写下你选择下一个检查工具的理由
+第二步：紧接着调用一个检查工具（analyze_complexity / check_security_issues / check_code_style / check_test_coverage_hints）
+第三步：重复"think → 检查工具"，直到完成所有必要检查
 
-规则：
-- think 只描述【当前这一步】的判断依据，不要一次列出所有计划
-- think 之后必须立刻调用一个实际检查工具，不可连续两次 think，也不可在 think 后直接结束
-- 根据代码特征按需选用工具，不必强制调用所有工具"""),
+绝对禁止：
+- 连续两次 think
+- think 后直接输出结论而不调用检查工具
+- 不调用 think 直接调用检查工具
+- 一次调用多个工具（每轮只允许一个工具调用）
+
+根据代码特征按需选用检查工具，不必强制全部调用。"""),
             ("human", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
         ])
-        callbacks = []  # 推理步骤通过 _format_react_output 后处理输出，不依赖 callback 传播
+        callbacks = []
     else:
+        llm = ChatOpenAI(
+            model="qwen-plus",
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            temperature=0,
+        )
         tools = REVIEW_TOOLS
         prompt = TOOL_CALLING_PROMPT
-        # callback 模式：用 ReasoningCallbackHandler 拦截工具调用事件
         callbacks = [ReasoningCallbackHandler()] if reasoning_mode == "callback" else []
 
     agent = create_tool_calling_agent(llm, tools, prompt)
@@ -590,14 +601,14 @@ def main():
     print("开始审查（推理过程实时输出）...")
     print("=" * 60 + "\n")
 
-    result = agent_executor.invoke({
-        "input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{SAMPLE_CODE}\n```"
-    })
-
-    print("\n" + "─" * 60)
-    print("推理过程（ReAct 格式）：")
-    print("─" * 60)
-    _format_react_output(result["intermediate_steps"])
+    # 通过 invoke config 传递 callback：LCEL 标准方式，callbacks 会传播到所有子 run（包括工具调用）
+    # 直接传给 AgentExecutor 构造函数的 callbacks 只对 executor 层事件可靠（on_agent_finish），
+    # 不能保证传播到 on_tool_start / on_tool_end
+    handler = ReasoningCallbackHandler(react_format=True)
+    result = agent_executor.invoke(
+        {"input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{SAMPLE_CODE}\n```"},
+        config={"callbacks": [handler]},
+    )
 
     print("\n" + "=" * 60)
     print("最终审查报告：")

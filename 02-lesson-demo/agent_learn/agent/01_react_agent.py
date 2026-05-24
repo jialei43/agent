@@ -20,7 +20,7 @@ from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import BaseCallbackHandler, StdOutCallbackHandler
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_react_agent, create_tool_calling_agent, AgentExecutor
 
@@ -309,12 +309,12 @@ class ReasoningCallbackHandler(BaseCallbackHandler):
 @tool
 def think(reasoning: str) -> str:
     """
-    在调用其他工具之前，先调用此工具记录你的推理过程。
-    参数 reasoning：说明你为什么选择下一个工具、期望获取什么信息。
-    这是一个推理记录工具，不会影响实际检查结果。
+    调用任何检查工具前，先调用此工具记录本步的判断依据。
+    参数 reasoning：只说明【当前这一步】为什么选下一个工具，不要一次列出所有计划。
+    调用此工具后必须紧接着调用一个实际检查工具，不可连续两次调用 think，也不可在 think 后直接结束。
     """
-    print(f"\n  [思考] {reasoning}")
-    return "推理已记录，请继续执行下一步"
+    print(f"\nThought: {reasoning}")
+    return "推理已记录。现在必须立即调用一个实际检查工具（analyze_complexity / check_security_issues / check_code_style / check_test_coverage_hints）。"
 
 
 REVIEW_TOOLS_WITH_THINK = [think] + REVIEW_TOOLS
@@ -345,23 +345,24 @@ REVIEW_TOOLS_WITH_THINK = [think] + REVIEW_TOOLS
 
 # [旧] 动态 ReAct 版：工具仍在 prompt 里，但不强制调用所有工具
 REACT_PROMPT = ChatPromptTemplate.from_template("""你是一个专业的企业级代码审查助手。
-根据提交代码的实际特征，自主判断最需要关注的审查维度，给出有针对性的专业意见。
+你必须通过调用工具来收集信息，禁止在调用工具之前直接输出 Final Answer。
 
-可用工具（根据代码特征按需选用，不必强制全部调用）：
+可用工具：
 {tools}
 
 工具名称：{tool_names}
 
-使用格式（严格遵守）：
-Thought: 观察代码特征，判断当前最值得检查哪个维度以及为什么
-Action: 工具名称
-Action Input: 工具的输入参数
-Observation: 工具返回的结果
-... （重复 Thought/Action/Observation，直到掌握足够信息）
-Thought: 已有足够信息，整理发现
-Final Answer: 针对本次代码最关键问题的审查报告，重点突出发现的实际问题，无问题的维度简略带过
+严格按照以下格式循环执行，每一行格式不能省略：
+Thought: 分析当前情况，说明为什么选下一个工具
+Action: 工具名称（只写名称，不加其他内容）
+Action Input: 传给工具的完整代码或参数
+Observation: （此行由系统填入工具返回结果，你不需要填写）
 
-开始审查：
+重复上述循环，直到掌握足够信息，然后输出：
+Thought: 已收集完所有必要信息
+Final Answer: 完整的审查报告
+
+开始：
 {input}
 
 {agent_scratchpad}""")
@@ -381,8 +382,9 @@ def build_react_agent(verbose: bool = True) -> AgentExecutor:
         verbose=verbose,
         max_iterations=10,
         max_execution_time=120,
-        handle_parsing_errors=True,      # ReAct 必须：文本解析失败时让 Agent 自我修正
+        handle_parsing_errors=True,
         return_intermediate_steps=True,
+        callbacks=[StdOutCallbackHandler()],  # 显式挂载，保证 Thought/Action/Observation 一定输出
     )
 
 
@@ -436,8 +438,14 @@ def build_tool_calling_agent(
         tools = REVIEW_TOOLS_WITH_THINK
         prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个专业的企业级代码审查助手。
-每次调用检查工具之前，必须先调用 think 工具写下你的判断依据（为什么选这个工具、期望发现什么）。
-根据代码实际特征按需选择检查工具，不必强制调用所有工具。"""),
+
+严格按照以下节奏工作，不得跳过任何步骤：
+  think（说明本步理由）→ 实际检查工具 → think（说明下一步理由）→ 实际检查工具 → ...→ 给出 Final Answer
+
+规则：
+- think 只描述【当前这一步】的判断依据，不要一次列出所有计划
+- think 之后必须立刻调用一个实际检查工具，不可连续两次 think，也不可在 think 后直接结束
+- 根据代码特征按需选用工具，不必强制调用所有工具"""),
             ("human", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
         ])
@@ -512,21 +520,18 @@ def main():
     #
     # 模式 A：Callback 拦截（推荐）
     #   推理过程由框架事件驱动显示，Agent 逻辑本身不变
-    agent_executor = build_tool_calling_agent(reasoning_mode="callback")
-    mode_label = "Tool Calling + Callback 推理可见"
+    # ── 两种模式，各有适用场景 ────────────────────────────────────────────────
     #
-    # 模式 B：think 工具
-    #   模型被提示词引导，主动调用 think() 记录判断依据
-    # agent_executor = build_tool_calling_agent(reasoning_mode="think_tool")
-    # mode_label = "Tool Calling + think 工具推理可见"
+    # ReAct：推理全程可见（Thought/Action/Observation），适合调试、学习、审计
+    #   LLM 把决策过程写成文本，框架用正则解析后调用工具
+    agent_executor = build_react_agent(verbose=True)
+    mode_label = "ReAct（Thought/Action/Observation 完整推理链）"
     #
-    # 模式 C：无推理输出（只看最终报告）
+    # Tool Calling：生产环境首选，结构化 JSON 调用，不显示推理过程
+    #   如果需要生产可靠性而不需要看推理，取消下面两行的注释
     # agent_executor = build_tool_calling_agent(reasoning_mode="none")
-    # mode_label = "Tool Calling（无推理输出）"
-    #
-    # 模式 D：ReAct（推理写在文本里，通过 verbose=True 可见）
-    # agent_executor = build_react_agent(verbose=True)
-    # mode_label = "ReAct（Thought/Action/Observation 文本格式）"
+    # mode_label = "Tool Calling（生产模式，无推理输出）"
+    # ─────────────────────────────────────────────────────────────────────────
     # ────────────────────────────────────────────────────────────────────────────
 
     print("=" * 60)

@@ -14,11 +14,10 @@ ReAct 核心：Thought → Action → Observation 循环
 import os
 import re
 import json
-import uuid
-import sqlite3
-import asyncio
 import textwrap
+from typing import Any
 from dotenv import load_dotenv, find_dotenv
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.callbacks import BaseCallbackHandler, StdOutCallbackHandler
@@ -461,23 +460,19 @@ def build_tool_calling_agent(
         tools = REVIEW_TOOLS_WITH_THINK
         prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个专业的企业级代码审查助手。
-你必须通过调用工具来收集信息，禁止在调用工具之前直接输出 Final Answer。
 
+【强制执行，每一轮必须严格遵守，违反则本次审查无效】：
+第一步：必须先调用 think 工具，写下你选择下一个检查工具的理由
+第二步：紧接着调用一个检查工具（analyze_complexity / check_security_issues / check_code_style / check_test_coverage_hints）
+第三步：重复"think → 检查工具"，直到完成所有必要检查
 
-严格按照以下格式循环执行，每一行格式不能省略：
-Thought: 分析当前情况，说明为什么选下一个工具
-Action: 工具名称（只写名称，不加其他内容）
-Action Input: 传给工具的完整代码或参数
-Observation: （此行由系统填入工具返回结果，你不需要填写）
+绝对禁止：
+- 连续两次 think
+- think 后直接输出结论而不调用检查工具
+- 不调用 think 直接调用检查工具
+- 一次调用多个工具（每轮只允许一个工具调用）
 
-重复上述循环，直到掌握足够信息，然后输出：
-Thought: 已收集完所有必要信息
-Final Answer: 完整的审查报告
-
-开始：
-{input}
-
-{agent_scratchpad}。"""),
+根据代码特征按需选用检查工具，不必强制全部调用。"""),
             ("human", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
         ])
@@ -531,135 +526,6 @@ def _format_react_output(intermediate_steps: list) -> None:
     print("\nThought: 已收集完所有必要信息，生成最终报告")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 企业级落地：流式输出 + 执行记录存储
-# ══════════════════════════════════════════════════════════════════════════════
-
-TOOL_LABELS = {
-    "think":                     "思考中...",
-    "check_security_issues":     "正在扫描安全漏洞...",
-    "analyze_complexity":        "正在分析代码复杂度...",
-    "check_code_style":          "正在检查代码规范...",
-    "check_test_coverage_hints": "正在分析测试覆盖...",
-}
-
-
-def init_db(db_path: str = "agent_executions.db") -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id    TEXT PRIMARY KEY,
-            final_answer TEXT,
-            step_count INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS execution_steps (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id    TEXT,
-            step_index INTEGER,
-            type       TEXT,       -- 'thought' | 'action'
-            tool       TEXT,
-            input      TEXT,       -- JSON 字符串
-            output     TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    return conn
-
-
-async def stream_and_save(
-    agent_executor: AgentExecutor,
-    code: str,
-    conn: sqlite3.Connection,
-    task_id: str,
-) -> None:
-    """
-    单次执行：通过 astream_events 同时完成
-      - 实时流式输出（用户侧体验）
-      - 收集每步结构化数据并存入 SQLite（持久化侧）
-
-    astream_events v2 关键事件：
-      on_tool_start  → 工具即将执行，显示友好进度提示
-      on_tool_end    → 工具执行完毕，收集结构化结果
-      on_chat_model_stream → Final Answer 逐字流式推送
-    """
-    steps: list[dict] = []
-    current_tool: dict | None = None
-    final_answer_parts: list[str] = []
-    step_index = 0
-    in_final_answer = False  # 区分推理阶段的 stream 和 Final Answer 的 stream
-
-    print("\n" + "─" * 60)
-
-    async for event in agent_executor.astream_events(
-        {"input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{code}\n```"},
-        version="v2",
-    ):
-        kind = event["event"]
-
-        if kind == "on_tool_start":
-            in_final_answer = False
-            tool_name = event["name"]
-            tool_input = event["data"].get("input", {})
-            current_tool = {"tool": tool_name, "input": tool_input, "index": step_index}
-            print(f"\n⚙️  {TOOL_LABELS.get(tool_name, tool_name)}", flush=True)
-
-        elif kind == "on_tool_end":
-            in_final_answer = False
-            if current_tool:
-                output = str(event["data"].get("output", ""))
-                steps.append({
-                    "task_id":    task_id,
-                    "step_index": current_tool["index"],
-                    "type":       "thought" if current_tool["tool"] == "think" else "action",
-                    "tool":       current_tool["tool"],
-                    "input":      json.dumps(current_tool["input"], ensure_ascii=False),
-                    "output":     output,
-                })
-                step_index += 1
-                if current_tool["tool"] != "think":
-                    print("  ✅ 完成", flush=True)
-                current_tool = None
-
-        elif kind == "on_chain_start" and event.get("name") == "AgentExecutor":
-            pass  # AgentExecutor 开始，忽略
-
-        elif kind == "on_chat_model_stream":
-            chunk_content = event["data"]["chunk"].content
-            if not chunk_content:
-                continue
-            # think_tool 模式下推理阶段也会触发 stream；
-            # Final Answer 阶段工具调用已结束，step_index > 0 且 current_tool 为 None
-            if current_tool is None and step_index > 0:
-                if not in_final_answer:
-                    in_final_answer = True
-                    print("\n\n" + "─" * 60)
-                    print("最终审查报告：")
-                    print("─" * 60)
-                print(chunk_content, end="", flush=True)
-                final_answer_parts.append(chunk_content)
-
-    final_answer = "".join(final_answer_parts)
-
-    # 持久化到 SQLite
-    if steps:
-        conn.executemany(
-            """INSERT INTO execution_steps
-               (task_id, step_index, type, tool, input, output)
-               VALUES (:task_id, :step_index, :type, :tool, :input, :output)""",
-            steps,
-        )
-    conn.execute(
-        "INSERT INTO tasks (task_id, final_answer, step_count) VALUES (?, ?, ?)",
-        (task_id, final_answer, len(steps)),
-    )
-    conn.commit()
-    print(f"\n\n✅ 执行记录已存库  task_id={task_id}  共 {len(steps)} 步")
-
-
 # 默认使用 Tool Calling 方式（更可靠）
 build_review_agent = build_tool_calling_agent
 
@@ -708,9 +574,23 @@ SAMPLE_CODE = textwrap.dedent("""
 
 
 def main():
-    """同步演示：invoke + Callback 推理可见（调试/学习用）"""
+    # ── 三种推理可见模式，切换注释体验差异 ──────────────────────────────────────
+    #
+    # 模式 A：Callback 拦截（推荐）
+    #   推理过程由框架事件驱动显示，Agent 逻辑本身不变
+    # ── 两种模式，各有适用场景 ────────────────────────────────────────────────
+    #
+    # ReAct：推理全程可见（Thought/Action/Observation），适合调试、学习、审计
+    #   LLM 把决策过程写成文本，框架用正则解析后调用工具
+    # agent_executor = build_react_agent(verbose=True)
+    # mode_label = "ReAct（Thought/Action/Observation 完整推理链）"
+    # #
+    # Tool Calling：生产环境首选，结构化 JSON 调用，不显示推理过程
+    #   如果需要生产可靠性而不需要看推理，取消下面两行的注释
     agent_executor = build_tool_calling_agent(reasoning_mode="think_tool")
     mode_label = "Tool Calling + Think Tool（ReAct 格式推理输出）"
+    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────
 
     print("=" * 60)
     print(f"  代码审查助手  [{mode_label}]")
@@ -721,6 +601,9 @@ def main():
     print("开始审查（推理过程实时输出）...")
     print("=" * 60 + "\n")
 
+    # 通过 invoke config 传递 callback：LCEL 标准方式，callbacks 会传播到所有子 run（包括工具调用）
+    # 直接传给 AgentExecutor 构造函数的 callbacks 只对 executor 层事件可靠（on_agent_finish），
+    # 不能保证传播到 on_tool_start / on_tool_end
     handler = ReasoningCallbackHandler(react_format=True)
     result = agent_executor.invoke(
         {"input": f"请对以下代码进行全面的企业级代码审查：\n```python\n{SAMPLE_CODE}\n```"},
@@ -734,35 +617,5 @@ def main():
     print(f"\n共执行了 {len(result['intermediate_steps'])} 次工具调用")
 
 
-async def main_stream():
-    """
-    异步演示：astream_events 流式输出 + SQLite 执行记录存储
-
-    特点：
-      - 每步工具执行完立刻推送友好提示，不等全部完成
-      - Final Answer 逐字流式输出
-      - 同一次执行同时完成展示和存库，不重复运行 Agent
-    """
-    agent_executor = build_tool_calling_agent(reasoning_mode="think_tool", verbose=False)
-
-    print("=" * 60)
-    print("  代码审查助手  [流式输出 + 执行记录存储]")
-    print("=" * 60)
-    print("\n待审查代码：")
-    print(SAMPLE_CODE)
-    print("\n" + "=" * 60)
-    print("开始审查（实时流式输出，结果同步存库）...")
-    print("=" * 60)
-
-    conn = init_db()
-    task_id = str(uuid.uuid4())
-    print(f"task_id: {task_id}")
-
-    await stream_and_save(agent_executor, SAMPLE_CODE, conn, task_id)
-    conn.close()
-
-
 if __name__ == "__main__":
-    # 切换注释选择演示模式
-    # main()                        # 同步模式：Callback 推理可见
-    asyncio.run(main_stream())    # 异步模式：流式输出 + 存库
+    main()

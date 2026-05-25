@@ -22,7 +22,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 load_dotenv(find_dotenv())
-
+QUALITY_THRESHOLD = 97.0    # 通过阈值：综合评分 >= 97
+MAX_ITERATIONS = 4          # 最大迭代次数（防止无限循环）
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 评分模型（Critic 输出严格结构化，Generator 才能针对性修订）
@@ -42,7 +43,7 @@ class CriticResult(BaseModel):
     dimensions: list[DimensionScore] = Field(description="各维度评分明细")
     critical_issues: list[str] = Field(description="必须修复的关键问题（影响报告可用性）")
     revision_priority: str = Field(description="修订重点（简明描述最重要的改进方向）")
-    approved: bool = Field(description="是否通过质检（overall_score >= 75 且无 critical_issues）")
+    approved: bool = Field(description=f"是否通过质检（overall_score >= {QUALITY_THRESHOLD} 且无 critical_issues）")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,8 +69,7 @@ class ReflectionAgent:
     Generator 和 Critic 使用不同 temperature，保证评估客观性。
     """
 
-    QUALITY_THRESHOLD = 75.0    # 通过阈值：综合评分 >= 75
-    MAX_ITERATIONS = 4          # 最大迭代次数（防止无限循环）
+
 
     # 事故复盘报告的评分维度定义
     RUBRIC = """
@@ -186,7 +186,7 @@ class ReflectionAgent:
 
 评分规则：
 - overall_score = 各维度分数的加权平均 * 10
-- approved = overall_score >= 75 且 critical_issues 为空
+- approved = overall_score >= {QUALITY_THRESHOLD} 且 critical_issues 为空
 - critical_issues：严重到影响报告可用性的问题（如：缺少根因分析、时间线完全缺失）
 - 评分要严格，不要给满分"""),
             HumanMessage(content=f"请评估以下事故复盘报告：\n\n{draft}"),
@@ -232,9 +232,9 @@ class ReflectionAgent:
         current_draft = ""
         revision_guidance = ""
 
-        for i in range(1, self.MAX_ITERATIONS + 1):
+        for i in range(1, MAX_ITERATIONS + 1):
             print(f"\n{'═'*50}")
-            print(f"  迭代 {i}/{self.MAX_ITERATIONS}")
+            print(f"  迭代 {i}/{MAX_ITERATIONS}")
             print(f"{'═'*50}")
 
             # Step 1: Generate
@@ -264,7 +264,7 @@ class ReflectionAgent:
                 print(f"\n  ✅ 质检通过（迭代{i}次），报告生成完毕")
                 break
 
-            if i == self.MAX_ITERATIONS:
+            if i == MAX_ITERATIONS:
                 print(f"\n  ⚠️  达到最大迭代次数，输出当前最佳版本（评分：{critic_result.overall_score:.1f}）")
 
         return current_draft, history
@@ -296,8 +296,8 @@ def main():
     print("=" * 60)
     print(f"\n原始事故信息（质量较低）：")
     print(SAMPLE_INCIDENT)
-    print(f"\n质检阈值：{ReflectionAgent.QUALITY_THRESHOLD}/100")
-    print(f"最大迭代：{ReflectionAgent.MAX_ITERATIONS}轮")
+    print(f"\n质检阈值：{QUALITY_THRESHOLD}/100")
+    print(f"最大迭代：{MAX_ITERATIONS}轮")
 
     agent = ReflectionAgent()
     final_report, history = agent.run(SAMPLE_INCIDENT)

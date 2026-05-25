@@ -255,15 +255,16 @@ class PlanAndExecuteAgent:
 
         messages = [
             SystemMessage(content=f"""你是一个专业的项目风险评估规划师。
-根据用户描述的项目，生成一个详细的风险评估执行计划。
+根据用户描述的项目信息和各工具的能力，自主制定最合理的风险评估执行计划。
 
-可用工具：
+可用工具（请仔细阅读工具说明，自主推断最优的执行顺序和步骤依赖关系）：
 {_tools_desc(TOOLS_MAP)}
 
-规划原则：
-1. calculate_risk_score 必须在其他评估完成后执行（依赖前三步结果）
-2. 前三个工具可以并行执行（depends_on 为空）
-3. tool_input 必须是从原始需求中提取的具体内容，不能是模板占位符"""),
+规划要求：
+- tool_input 必须是从原始需求中提取的具体内容，不能是模板占位符
+- depends_on 字段应如实反映工具间的数据依赖关系
+- 可以并行的步骤使用 depends_on=[]，有前置依赖的步骤填写实际依赖的步骤编号
+            """),
             HumanMessage(content=f"请为以下项目制定风险评估计划：\n\n{task}"),
         ]
 
@@ -327,17 +328,19 @@ class PlanAndExecuteAgent:
                 time.sleep(0.5)
 
     def _compose_input_from_deps(self, step: PlanStep, dep_outputs: dict) -> str:
-        """用 Executor LLM 根据依赖步骤的输出组装当前步骤的输入"""
-        dep_summary = "\n".join(
-            f"步骤{dep_id}结果：{output[:300]}"
-            for dep_id, output in dep_outputs.items()
-        )
-        messages = [
-            SystemMessage(content="根据前序步骤的结果，提取关键风险数量，组装为格式 'LEVEL:count,LEVEL:count' 的字符串"),
-            HumanMessage(content=f"前序结果：\n{dep_summary}\n\n请统计各级别风险数量并输出格式字符串"),
-        ]
-        response = self.llm.invoke(messages)
-        return response.content.strip()
+        """从前序步骤的输出中统计各级别风险数量，构造 calculate_risk_score 所需的输入格式。
+        用正则直接计数，避免让 LLM 生成格式字符串导致输出不稳定。
+        """
+        import re
+        combined = "\n".join(dep_outputs.values())
+        counts: dict[str, int] = {}
+        for level in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            matches = re.findall(rf'\[{level}\]', combined)
+            if matches:
+                counts[level] = len(matches)
+        if not counts:
+            return "LOW:1"   # 兜底：至少传一个合法值
+        return ",".join(f"{level}:{cnt}" for level, cnt in counts.items())
 
     def execute_plan(self, plan: ExecutionPlan) -> list[StepResult]:
         """按计划顺序执行所有步骤"""
